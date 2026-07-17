@@ -1,16 +1,99 @@
 import time
-import os
-import glob
 import serial
 import requests
 from adafruit_pn532.uart import PN532_UART
+from serial.tools import list_ports
+
+
+PN532KILLER_VID_PID = (0x1A86, 0x55D3)
+
+
+class PlexampPN532_UART(PN532_UART):
+    # Don't crash on no-card polls
+    def get_passive_target(self, timeout=1):
+        response = self.process_response(
+            0x4A,  # InListPassiveTarget
+            response_length=64,
+            timeout=timeout,
+        )
+
+        if not response or response[0] == 0:
+            return None
+
+        if response[0] != 1:
+            raise RuntimeError(f"Unexpected target count: {response[0]}")
+
+        uid_length = response[5]
+        if uid_length > 7:
+            raise RuntimeError("Found card with unexpectedly long UID!")
+
+        return response[6 : 6 + uid_length]
+
+
+class PN532Killer_UART(PlexampPN532_UART):
+    @staticmethod
+    def _crc16a(data):
+        crc = 0x6363
+        for value in data:
+            value ^= crc & 0xFF
+            value = (value ^ (value << 4)) & 0xFF
+            crc = (crc >> 8) ^ (value << 8) ^ (value << 3) ^ (value >> 4)
+        return (crc & 0xFFFF).to_bytes(2, byteorder="little")
+
+    def ntag2xx_read_block(self, block_number):
+        # PN532Killer acknowledges InDataExchange reads but doesn't return
+        # data. Its supported raw-card path is InCommunicateThru with
+        # the ISO14443A CRC appended to the MIFARE READ command.
+        command = bytes((0x30, block_number & 0xFF))
+        response = self.call_function(
+            0x42,  # InCommunicateThru
+            params=command + self._crc16a(command),
+            response_length=19,  # status + 16 data bytes + 2 CRC bytes
+        )
+
+        if not response or response[0] != 0:
+            return None
+
+        # A MIFARE READ returns four pages. Keep the requested 4-byte page to
+        # match the Adafruit ntag2xx_read_block API.
+        return response[1:5]
+
+
+# ----------------------------
+# Helper: identify pn532killer boards using usb metadata
+# ----------------------------
+def is_pn532killer(port):
+    product = port.product or ""
+    description = port.description or ""
+    return (
+        "PN532Killer" in product
+        or "PN532Killer" in description
+        or (port.vid, port.pid) == PN532KILLER_VID_PID
+    )
+
 
 # ----------------------------
 # Helper: find PN532 serial device
 # ----------------------------
 def find_uart_device():
-    devices = glob.glob("/dev/ttyUSB*")
-    return devices[0] if devices else None
+    ports = list(list_ports.comports())
+
+    # Prefer readers that can be positively identified
+    for port in ports:
+        if is_pn532killer(port):
+            return port
+
+    # Generic ttyACMs are only considered when no ttyUSBs exist
+    for device_prefix in ("/dev/ttyUSB", "/dev/ttyACM"):
+        candidates = sorted(
+            (port for port in ports if port.device.startswith(device_prefix)),
+            key=lambda port: port.device,
+        )
+        if candidates:
+            return candidates[0]
+
+    return None
+
 
 # ----------------------------
 # Helper: parse NDEF URI
@@ -33,25 +116,42 @@ def parse_ndef_uri(tag_data):
     full_url = full_url.rstrip(" \n\r\x00\xfe\t")
     return full_url
 
+
 # ----------------------------
 # NFC reader setup
 # ----------------------------
 def connect_reader():
     while True:
-        device = find_uart_device()
-        if not device:
+        port = find_uart_device()
+        if not port:
             print("Waiting for NFC reader...")
             time.sleep(2)
             continue
+
+        device = port.device
         try:
-            ser = serial.Serial(device, baudrate=115200, timeout=1)
-            pn532 = PN532_UART(ser, debug=False)
+            ser = serial.Serial(baudrate=115200, timeout=1)
+
+            if is_pn532killer(port):
+                # pySerial asserts DTR and RTS by default. Incorrect DTR/RTS
+                # handling on a PN532Killer disrupts its configuration.
+                ser.dtr = False
+                ser.rts = False
+
+            ser.port = device
+            ser.open()
+
+            reader_class = (
+                PN532Killer_UART if is_pn532killer(port) else PlexampPN532_UART
+            )
+            pn532 = reader_class(ser, debug=False)
             pn532.SAM_configuration()
             print(f"NFC reader connected on {device}")
             return pn532
         except Exception as e:
             print(f"Failed to connect to {device}: {e}")
             time.sleep(2)
+
 
 # ----------------------------
 # Debounce & memory variables
@@ -60,6 +160,7 @@ last_uid = None
 last_url = None
 last_seen_time = 0
 forget_after = 30  # seconds to "forget" a tag after removal
+
 
 # ----------------------------
 # Main
@@ -155,6 +256,3 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Reader error: {e}. Reconnecting...")
             pn532 = connect_reader()
-
-
-
