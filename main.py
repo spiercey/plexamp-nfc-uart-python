@@ -2,8 +2,9 @@ import time
 import os
 import glob
 import serial
-import requests
 from adafruit_pn532.uart import PN532_UART
+
+from plexamp import InvalidPlaybackURL, PlexampClient, prepare_playback_url
 
 # ----------------------------
 # Helper: find PN532 serial device
@@ -66,6 +67,7 @@ forget_after = 30  # seconds to "forget" a tag after removal
 # ----------------------------
 if __name__ == "__main__":
     pn532 = connect_reader()
+    plexamp = PlexampClient()
 
     while True:
         try:
@@ -133,6 +135,11 @@ if __name__ == "__main__":
             # Convert to local Plexamp URL
             local_url = full_url.replace("https://listen.plex.tv", "http://localhost:32500")
             local_url = local_url.replace("http://listen.plex.tv", "http://localhost:32500")
+            try:
+                local_url = prepare_playback_url(local_url)
+            except InvalidPlaybackURL as e:
+                print(f"Invalid playback URL: {e}")
+                continue
             print(f"Local Plexamp URL: {local_url}")
 
             # If same URL as before and still within active session, skip
@@ -140,21 +147,18 @@ if __name__ == "__main__":
                 print("Same tag & URL already active — skipping trigger.")
                 continue
 
-            last_url = local_url
-
             # Trigger Plexamp playback
             try:
-                response = requests.get(local_url)
-                if response.ok:
+                result = plexamp.play(local_url)
+                if result.success:
+                    last_url = local_url
                     print(f"Playback triggered! ({kind})")
                 else:
-                    print(f"Error triggering playback: {response.status_code}")
+                    print(f"Failed to trigger Plexamp: {result.message}")
             except Exception as e:
                 print(f"Failed to trigger Plexamp: {e}")
 
         except Exception as e:
             print(f"Reader error: {e}. Reconnecting...")
             pn532 = connect_reader()
-
-
 
