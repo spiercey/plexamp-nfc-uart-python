@@ -1,59 +1,40 @@
 # The Plexamp URL format
 
-This project reads a URL off an NFC tag and hands it to Plexamp, but what that
-URL actually looks like is not documented anywhere, and the obvious guesses are
-all wrong in the same way. This is what works, so you can write tags without
-owning a phone that can write them, or build the links yourself from Plex ids.
+What actually goes on a tag, so you can build links from Plex ids instead of
+guessing. Tested against Plexamp on iOS, September 2026.
 
-Worked out against Plexamp on iOS in September 2026. Everything below was
-tested; anything that was not is called out at the end.
+## Two different things
 
-## Browse and playback are not variations of each other
-
-They use different identifiers, which is the single fact that makes everything
-else make sense.
-
-| | Identifier | Needs the server named? |
+| | Identifier | Server named? |
 |---|---|---|
-| **Browse** — open the album's page | the **global** album id, `plex://album/<id>` | no |
-| **Playback** — start it playing | the **local** rating key, plus a play queue | yes |
+| Browse — open the page | global guid, `plex://<kind>/<id>` | no |
+| Playback — start it playing | local `ratingKey` + a play queue | yes |
 
-Browsing, for each kind:
+Using one identifier for the other's job is the mistake that costs the most
+time. A ratingKey on a browse URL opens a *different* item, with no error.
+
+## Browse
 
 ```
-https://listen.plex.tv/album/<id>      from guid plex://album/<id>
-https://listen.plex.tv/artist/<id>     from guid plex://artist/<id>
-https://listen.plex.tv/track/<id>      from guid plex://track/<id>
+https://listen.plex.tv/album/<id>
+https://listen.plex.tv/artist/<id>
+https://listen.plex.tv/track/<id>
 ```
 
-The id is what your server reports as `guid`, minus the `plex://<kind>/`
-prefix. It arrives free on any library listing, so no extra call, and it
-identifies the thing everywhere rather than on one server, which is why nothing
-else has to be named.
+`<id>` is the item's `guid` minus the `plex://<kind>/` prefix. It is on every
+library listing already. No server, no token.
 
-**Playlists cannot be browsed this way.** A playlist's guid is not a `plex://`
-id at all, it is something like `com.plexapp.agents.none://<uuid>`. Playlists
-are server-local objects, so there is no global thing to link to. They can still
-be played, which is below.
+Playlists have no global guid (theirs is `com.plexapp.agents.none://<uuid>`),
+so they cannot be browsed this way. They can be played.
 
-Playback is the rest of this document.
-
-**Do not put a rating key on a browse URL.** It opens *an* album, just not
-yours: rating keys mean nothing off the server that issued them, so it lands on
-whatever happens to carry that number. This is a silent wrong answer, not an
-error, and it is the single most misleading thing about the whole area.
-
-## The short version
-
-Plexamp does not take a link to an album. It takes a **player command**, and
-that command needs a **play queue**, not just an item:
+## Playback
 
 ```
 https://listen.plex.tv/player/playback/playMedia
   ?type=music
   &key=/library/metadata/<ratingKey>
   &containerKey=/playQueues/<playQueueID>?own=1
-  &machineIdentifier=<server machine identifier>
+  &machineIdentifier=<server machine id>
   &protocol=http
   &address=<server address>
   &port=32400
@@ -61,114 +42,68 @@ https://listen.plex.tv/player/playback/playMedia
   &commandID=1
 ```
 
-Tapping that on a device with Plexamp installed opens the app and starts
-playing. It is a universal link, not a custom scheme.
+No token needed — Plexamp is signed in to the account that owns the queue.
 
-## Why a play queue
+### The queue is required
 
-Given `key` alone, Plexamp answers **"can't start playback, try again"**. The
-Plex player protocol wants something to play rather than something to find, so
-you have to build a queue first and pass its `containerKey`. This is the same
-thing any Plex controller does before telling a player to start.
-
-Build one against your server:
+With `key` alone, Plexamp says **"can't start playback, try again"**. Build one
+first:
 
 ```
 POST http://<server>:32400/playQueues
   ?type=audio
-  &uri=server://<machineIdentifier>/com.plexapp.plugins.library/library/metadata/<ratingKey>
+  &uri=server://<machineId>/com.plexapp.plugins.library/<path>
   &shuffle=0&repeat=0&continuous=0
   &X-Plex-Token=<token>
 
 Headers: X-Plex-Client-Identifier, X-Plex-Product, X-Plex-Version, X-Plex-Platform
 ```
 
-The response carries `playQueueID` and the queue's items. Use the first item's
-`key` as `key`, and the queue id as `containerKey`. An album URI produces a
-queue of the whole album, so this plays the record, not one track.
+Take `playQueueID` and the first item's `key` from the response.
 
-## Albums, tracks, artists and playlists
+`<path>` by kind:
 
-All four are the same command. Only the `uri` the play queue is built from
-changes, and Plex expands it:
-
-| Kind | Queue built from | Result |
+| Kind | path | queue contains |
 |---|---|---|
-| Album | `library/metadata/<ratingKey>` | every track on the album |
-| Track | `library/metadata/<ratingKey>` | that one track |
-| Artist | `library/metadata/<ratingKey>` | everything by them in the library |
+| Album | `library/metadata/<ratingKey>` | the whole album |
+| Track | `library/metadata/<ratingKey>` | that track |
+| Artist | `library/metadata/<ratingKey>` | everything of theirs in the library |
 | Playlist | `playlists/<ratingKey>` | the playlist, smart ones included |
 
-Album, track and artist take the same path; Plex works out which from the item
-itself. Only the playlist differs, and note it is `playlists/<id>` — with
-`/items` on the end you get a queue of nothing, silently, which looks exactly
-like a broken playlist. `playlistID=<id>` as a query parameter works too.
+Album, track and artist share a path; Plex infers the kind. `playlistID=<id>`
+as a parameter also works for playlists.
 
-Once the queue exists, the playMedia URL is identical for all four.
+**`playlists/<id>/items` returns an empty queue and no error.** Use
+`playlists/<id>`.
 
-## You do not need a token in the URL
+## Why it doesn't fit an NTAG213
 
-Confirmed. Every playback link above was tapped with no `token` parameter at
-all and played. Plexamp is signed in to the account that owns the queue, so it
-authenticates itself.
+That tag holds ~130 characters of URI. A playback URL carries a queue id, a
+machine identifier and an address, so it is longer. If a candidate URL is much
+shorter than 130 characters, it is the wrong shape.
 
-Leave it out. A token in a URL ends up in browser history and in anything the
-link is shared through, and it is a long lived credential for the whole server.
-If a real NFC tag does carry one, that is worth knowing about before you stick
-one to a record sleeve where anyone can read it with a phone.
+## Dead ends
 
-## How this was found
+- No `plexamp://` album scheme exists. The bare scheme opens the app, nothing more.
+- `listen.plex.tv/library/metadata/<ratingKey>` opens the wrong item, silently.
+- Share menu → Copy Link gives the `app.plex.tv` browse URL, whatever the
+  playback toggle is set to. It is not what gets written to a tag.
+- A global guid will not play anything; playback needs a queue, and a queue is
+  built on one server.
+- The `mbid://` guid Plex also carries is no use for either.
 
-The format is not published, but it is recoverable, and this repository is
-where the thread starts. It takes the tag's URL and swaps the host for
-Plexamp's own local API:
+## An app bug worth knowing about
 
-```
-https://listen.plex.tv/<path>   ->   http://localhost:32500/<path>
-```
+The first link works. A second link, to a different item, opens Plexamp but
+leaves it wherever it already was. Quitting Plexamp and tapping again lands
+correctly, every time.
 
-That host swap is the giveaway. The path is a **Plexamp API path**, and headless
-Plexamp's API on port 32500 speaks the Plex player protocol, which is where
-`/player/playback/playMedia` comes from.
+So it is not the URLs: the same link works or does not depending only on
+whether the app has already handled one this session. If you are building
+something that hands Plexamp several links in a row, expect this.
 
-A second clue, from a comment on r/homeassistant: the URL Plexamp writes **does
-not fit an NTAG213**, which holds roughly 130 characters of URI. Any candidate
-much shorter than that is the wrong shape. A command carrying a queue id, a
-machine identifier and an address comfortably exceeds it.
+## Not verified
 
-## Dead ends, so you can skip them
-
-- **There is no `plexamp://` album scheme.** The bare scheme opens the app and
-  does nothing else. Every path and query variant tried under it did the same.
-- **`https://listen.plex.tv/library/metadata/<ratingKey>` opens the wrong
-  album.** A rating key is meaningful only on the server that issued it;
-  resolved anywhere else it lands on whatever happens to share that number.
-- **The Share menu's Copy Link gives you the browse URL**, on `app.plex.tv`,
-  even with the playback toggle set. Copy Link and NFC tag writing do not
-  produce the same string.
-- **A global id will not play anything.** `plex://album/<id>` is exactly right
-  for browsing and useless for playback, because playback needs a queue and a
-  queue is built on a particular server. Using either id for the other job is
-  the mistake that costs the most time here.
-- **The `mbid://` Plex also carries is no use for either.**
-- **MusicBrainz cannot bridge an external album to your copy.** Going from a
-  Spotify id to a release to a release group lands on a different MBID than the
-  one Plex holds for the same album, at least sometimes. Relevant if you are
-  trying to link something like an album-of-the-day service to a local library:
-  there is no identifier joining them, and matching on artist and title is the
-  only route.
-
-## Reliability
-
-Opening the app this way works, but not every single time. When it misses it
-tends to open Plexamp without landing anywhere in particular, and trying again
-works. That appears to be the app rather than the URLs, since the same link
-behaves differently on consecutive taps.
-
-## Still unknown
-
-- The exact string Plexamp writes to a tag. Everything here is a
-  reconstruction from the protocol that behaves correctly, not a capture, so
-  the tag may well carry something shorter or differently ordered.
-- Stations. The tag readers recognise a `stations` path, but there was nothing
-  to test it against.
+- The literal bytes on a tag. This is reconstructed from the player protocol,
+  not captured, so a real tag may differ in order or extras.
+- Stations. The reader recognises a `stations` path; nothing here to test with.
