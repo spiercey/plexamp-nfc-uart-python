@@ -3,7 +3,9 @@ import serial
 import requests
 from adafruit_pn532.uart import PN532_UART
 from serial.tools import list_ports
+from urllib.parse import urlsplit, urlunsplit, parse_qs, urlencode
 
+PLEX_LIBRARY = "com.plexapp.plugins.library"
 
 PN532KILLER_VID_PID = (0x1A86, 0x55D3)
 
@@ -71,7 +73,6 @@ def is_pn532killer(port):
         or (port.vid, port.pid) == PN532KILLER_VID_PID
     )
 
-
 # ----------------------------
 # Helper: find PN532 serial device
 # ----------------------------
@@ -116,6 +117,24 @@ def parse_ndef_uri(tag_data):
     full_url = full_url.rstrip(" \n\r\x00\xfe\t")
     return full_url
 
+def to_create_play_queue(url):
+    """Caldera does not implement the legacy playMedia command."""
+    parts = urlsplit(url)
+    if "playMedia" not in parts.path:
+        return url
+    q = parse_qs(parts.query, keep_blank_values=True)
+    if not q.get("uri"):
+        key = (q.get("key") or [""])[0]
+        mid = (q.get("machineIdentifier") or q.get("machine") or [""])[0]
+        if not key or not mid:
+            return url
+        q["uri"] = [f"server://{mid}/{PLEX_LIBRARY}{key}"]
+    q.setdefault("type", ["audio"])
+    q.pop("containerKey", None)
+    return urlunsplit(parts._replace(
+        path=parts.path.replace("playMedia", "createPlayQueue"),
+        query=urlencode(q, doseq=True),
+    ))
 
 # ----------------------------
 # NFC reader setup
@@ -234,6 +253,7 @@ if __name__ == "__main__":
             # Convert to local Plexamp URL
             local_url = full_url.replace("https://listen.plex.tv", "http://localhost:32500")
             local_url = local_url.replace("http://listen.plex.tv", "http://localhost:32500")
+            local_url = to_create_play_queue(local_url)
             print(f"Local Plexamp URL: {local_url}")
 
             # If same URL as before and still within active session, skip
